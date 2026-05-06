@@ -1,75 +1,84 @@
-"""Composable log processing pipeline."""
+"""Composable pipeline builder for log processing stages.
 
-from __future__ import annotations
+This module extends the existing pipeline with redaction support.
+"""
 
-from typing import Callable, Iterable, Iterator, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
-from logslice.deduplicator import dedupe_exact, dedupe_window
 from logslice.log_filter import filter_logs
-from logslice.sampler import sample_every_nth, sample_random
+from logslice.deduplicator import dedupe_exact, dedupe_window
+from logslice.sampler import sample_random, sample_every_nth
+from logslice.redactor import redact_entries
+
+Entry = Dict[str, Any]
+Stage = Callable[[Iterable[Entry]], Iterator[Entry]]
 
 
-Stage = Callable[[Iterable[dict]], Iterator[dict]]
-
-
-def build_pipeline(*stages: Stage) -> Stage:
-    """Compose multiple pipeline stages into a single callable.
-
-    Each stage is a function that accepts and returns an iterable of dicts.
-    Stages are applied left-to-right.
-    """
-    def pipeline(entries: Iterable[dict]) -> Iterator[dict]:
-        stream: Iterable[dict] = entries
-        for stage in stages:
-            stream = stage(stream)
-        return iter(stream)
-
-    return pipeline
+def stage(fn: Callable[..., Iterator[Entry]], **kwargs) -> Stage:
+    """Partially apply *kwargs* to *fn*, returning a single-arg Stage."""
+    def _stage(entries: Iterable[Entry]) -> Iterator[Entry]:
+        return fn(entries, **kwargs)
+    _stage.__name__ = fn.__name__
+    return _stage
 
 
 def filter_stage(query: str) -> Stage:
-    """Return a pipeline stage that filters entries by *query*."""
-    def stage(entries: Iterable[dict]) -> Iterator[dict]:
-        return filter_logs(entries, query)
-    return stage
+    return stage(filter_logs, query=query)
 
 
-def dedupe_exact_stage(fields: Optional[list[str]] = None) -> Stage:
-    """Return a pipeline stage that removes exact duplicate entries."""
-    def stage(entries: Iterable[dict]) -> Iterator[dict]:
-        return dedupe_exact(entries, fields=fields)
-    return stage
+def dedupe_exact_stage(fields: Optional[List[str]] = None) -> Stage:
+    return stage(dedupe_exact, fields=fields)
 
 
-def dedupe_window_stage(
-    window_size: int = 100,
-    fields: Optional[list[str]] = None,
-) -> Stage:
-    """Return a pipeline stage that suppresses duplicates within a window."""
-    def stage(entries: Iterable[dict]) -> Iterator[dict]:
-        return dedupe_window(entries, window_size=window_size, fields=fields)
-    return stage
+def dedupe_window_stage(size: int, fields: Optional[List[str]] = None) -> Stage:
+    return stage(dedupe_window, window_size=size, fields=fields)
+
+
+def sample_random_stage(rate: float, seed: Optional[int] = None) -> Stage:
+    return stage(sample_random, rate=rate, seed=seed)
 
 
 def sample_nth_stage(n: int) -> Stage:
-    """Return a pipeline stage that keeps every *n*-th entry."""
-    def stage(entries: Iterable[dict]) -> Iterator[dict]:
-        return sample_every_nth(entries, n)
-    return stage
+    return stage(sample_every_nth, n=n)
 
 
-def sample_rate_stage(rate: float, seed: Optional[int] = None) -> Stage:
-    """Return a pipeline stage that randomly samples entries at *rate*."""
-    def stage(entries: Iterable[dict]) -> Iterator[dict]:
-        return sample_random(entries, rate, seed=seed)
-    return stage
+def redact_stage(
+    fields: Optional[List[str]] = None,
+    strategy: str = "mask",
+    salt: str = "",
+    visible: int = 4,
+) -> Stage:
+    """Pipeline stage that redacts sensitive fields from each entry."""
+    return stage(
+        redact_entries,
+        fields=fields,
+        strategy=strategy,
+        salt=salt,
+        visible=visible,
+    )
 
 
-def limit_stage(n: int) -> Stage:
-    """Return a pipeline stage that yields at most *n* entries."""
-    def stage(entries: Iterable[dict]) -> Iterator[dict]:
-        for i, entry in enumerate(entries):
-            if i >= n:
-                break
-            yield entry
-    return stage
+def build_pipeline(stages: List[Stage]) -> Stage:
+    """Compose a list of stages into a single stage."""
+    def _pipeline(entries: Iterable[Entry]) -> Iterator[Entry]:
+        stream: Iterable[Entry] = entries
+        for s in stages:
+            stream = s(stream)
+        return iter(stream)
+    return _pipeline
+
+
+def pipeline(
+    entries: Iterable[Entry],
+    stages: List[Stage],
+) -> Iterator[Entry]:
+    """Run *entries* through each stage in order."""
+    return build_pipeline(stages)(entries)
+
+
+def iter_with_sequence(
+    entries: Iterable[Entry],
+    field: str = "_seq",
+) -> Iterator[Entry]:
+    for i, entry in enumerate(entries):
+        yield {**entry, field: i}
